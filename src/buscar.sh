@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 # 1) Seu mnemonico. Ponha ? onde nao sabe a palavra. Tudo entre aspas, numa linha so.
 M="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon ?"
 
-# 2) O endereco-alvo do puzzle (comeca com 1).
+# 2) O endereco-alvo do puzzle: BTC (comeca com 1) ou ETH (comeca com 0x).
 H="1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA"
 
 # ------------------------------------------------------------

@@ -4,8 +4,11 @@ Recuperador de seed **BIP39** por força bruta: você informa o mnemônico com `
 posições que não sabe e o endereço-alvo, e o programa descobre as palavras que faltam.
 Usa CPU (multithread) e, com `--gpu`, **todas** as GPUs OpenCL detectadas em paralelo.
 
-> Derivação usada: **BIP44 legacy `m/44'/0'/0'/0/0`** → endereços que começam com `1...`.
-> (Endereços `3...` SegWit-P2SH ou `bc1...` bech32 **não** são suportados no momento.)
+> Suporta dois tipos de alvo, detectados automaticamente pelo `--hash`:
+> - **Bitcoin** — BIP44 legacy `m/44'/0'/0'/0/0` → endereços `1...`.
+> - **Ethereum** — BIP44 `m/44'/60'/0'/0/0` + Keccak-256 → endereços `0x...`.
+>
+> (Endereços BTC `3...` SegWit-P2SH ou `bc1...` bech32 **não** são suportados no momento.)
 
 ---
 
@@ -18,6 +21,9 @@ O que foi adicionado/corrigido em relação à versão anterior:
   Antes o endereço saía da chave-mestra `m` direto, sem caminho de derivação — não
   correspondia a nenhuma carteira. Validado contra uma referência independente:
   `abandon`×11 + `about` → `1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA`.
+- **Suporte a Ethereum.** Detecta automaticamente alvos `0x...` e usa BIP44
+  `m/44'/60'/0'/0/0` + **Keccak-256** (comparação ignora maiúsc./minúsc. do EIP-55).
+  Validado: a seed de teste → `0x9858EfFD232B4033E47d90003D41EC34EcaEda94`.
 - **Suporte a múltiplas GPUs.** Com `--gpu`, o programa detecta e usa **todas** as GPUs
   OpenCL ao mesmo tempo (testado com RTX 3060 + GTX 1070).
 - **Correções no motor OpenCL** (`gpu_engine.hpp`): o `clBuildProgram` recebia uma lista
@@ -32,8 +38,8 @@ O que foi adicionado/corrigido em relação à versão anterior:
   `src/buscar.sh` (você edita o mnemônico e o alvo e roda), além deste README e um
   `.gitignore` para o binário.
 
-> **Ainda em aberto:** só endereços `1...`; não valida o checksum do BIP39 (testa também
-> combinações inválidas); a saída ETH continua incorreta (usa SHA256 no lugar de Keccak-256).
+> **Ainda em aberto:** BTC só endereços `1...` (não `3...`/`bc1...`); não valida o checksum
+> do BIP39 (testa também combinações inválidas).
 
 ---
 
@@ -138,7 +144,7 @@ echo "$M" | wc -w    # tem que dar 12 ou 24
 | Opção | Descrição |
 |---|---|
 | `--mnemonic "..."` | Palavras; use `?` nas posições desconhecidas |
-| `--hash <endereço>` | Endereço BTC alvo (`1...`) a encontrar |
+| `--hash <endereço>` | Endereço alvo a encontrar — BTC `1...` ou ETH `0x...` (auto-detectado) |
 | `--lang <idioma>` | Wordlist (padrão: `english`) |
 | `--wordlist <arquivo>` | Wordlist customizada |
 | `--fix "pos:palavra"` | Fixa uma palavra numa posição (posições começam em 0) |
@@ -158,6 +164,6 @@ divisão é igual entre as placas, que se mostrou mais rápida e estável).
 
 - O programa **não valida o checksum** do BIP39 (a última palavra), então ele testa também
   combinações inválidas — funciona, mas não é o mais eficiente.
-- A saída **ETH** do modo de derivação direta é conhecida como incorreta (usa SHA256 em vez de
-  Keccak-256); confie apenas na saída **BTC**.
+- Alvos são **auto-detectados**: `0x...` → Ethereum (`m/44'/60'/0'/0/0` + Keccak-256);
+  senão → Bitcoin legacy (`m/44'/0'/0'/0/0`). ETH compara ignorando maiúsc./minúsc. (EIP-55).
 - Por estar em teste, podem ocorrer erros — reporte via issues.

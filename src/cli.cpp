@@ -87,9 +87,23 @@ int main_cli(int argc, char* argv[]) {
         char buf[300];
         size_t blen = 0;
         build_mnemonic_fast(mn, buf, blen);
-        std::string btc = cryptowords::Bip39Deriver::derive_btc_address_from_string(buf, blen);
-        std::cout << "BTC: " << btc << std::endl;
-        std::cout << (cryptowords::HashValidator::validate_target(btc, cfg.target) ? "MATCH!" : "NO MATCH") << std::endl;
+        bool eth = cfg.target.size() >= 2 && cfg.target[0] == '0'
+                   && (cfg.target[1] == 'x' || cfg.target[1] == 'X');
+        std::string addr = eth
+            ? cryptowords::Bip39Deriver::derive_eth_address_from_string(buf, blen)
+            : cryptowords::Bip39Deriver::derive_btc_address_from_string(buf, blen);
+        std::cout << (eth ? "ETH: " : "BTC: ") << addr << std::endl;
+
+        // Compara pelo endereco derivado (case-insensitive para ETH).
+        bool ok = (addr.size() == cfg.target.size());
+        if (ok) {
+            for (size_t i = 0; i < addr.size() && ok; ++i) {
+                char a = addr[i], b = cfg.target[i];
+                if (eth) { if (a >= 'A' && a <= 'Z') a += 32; if (b >= 'A' && b <= 'Z') b += 32; }
+                if (a != b) ok = false;
+            }
+        }
+        std::cout << (ok ? "MATCH!" : "NO MATCH") << std::endl;
         return 0;
     }
 

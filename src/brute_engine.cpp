@@ -96,12 +96,10 @@ void BruteEngine::run(
                     vts.emplace_back([&, t, nt, n]() {
                         secp256k1_context* lctx =
                             secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-                        char base58_buf[64];
                         for (size_t i = t; i < n && !found.load(std::memory_order_relaxed); i += nt) {
-                            size_t b58_len = cryptowords::Bip39Deriver::seed_to_p2pkh_bip44(
-                                batch.seeds[i].data(), base58_buf, lctx);
-                            if (b58_len == target_bytes.len &&
-                                std::memcmp(base58_buf, target_bytes.data, target_bytes.len) == 0) {
+                            // Compara com o alvo (BTC 1... ou ETH 0x..., auto-detectado).
+                            if (cryptowords::Bip39Deriver::seed_matches_target(
+                                    batch.seeds[i].data(), target_bytes.data, target_bytes.len, lctx)) {
                                 found.store(true, std::memory_order_relaxed);
                                 std::lock_guard<std::mutex> lk(cout_mutex);
                                 std::cout << "\n  MATCH FOUND (GPU)!\n  Mnemonic: ";

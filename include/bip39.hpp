@@ -9,6 +9,7 @@
 #include <secp256k1.h>
 #include <openssl/hmac.h>
 #include "crypto_impl.hpp"
+#include "keccak256.hpp"
 #include "Arbitrary/UInt.hpp"
 
 // Define helper para predição de branch se não existir no ambiente global
@@ -113,6 +114,77 @@ public:
     }
 
     // ============================================================
+    // Ethereum: BIP44 m/44'/60'/0'/0/0 + Keccak-256
+    // ============================================================
+    // Deriva a chave privada em m/44'/60'/0'/0/0 (coin type 60 = ETH) da seed.
+    static bool eth_seed_to_privkey(const uint8_t seed[64], uint8_t out_priv[32], secp256k1_context* ctx) {
+        uint8_t I[64];
+        unsigned int md_len = 64;
+        HMAC(EVP_sha512(), "Bitcoin seed", 12, seed, 64, I, &md_len);
+        uint8_t k[32], c[32];
+        std::memcpy(k, I, 32);
+        std::memcpy(c, I + 32, 32);
+        static constexpr uint32_t H = 0x80000000u;
+        const uint32_t path[5] = { 44u | H, 60u | H, 0u | H, 0u, 0u };  // m/44'/60'/0'/0/0
+        for (int i = 0; i < 5; ++i) {
+            if (!ckd_priv(k, c, path[i], ctx)) return false;
+        }
+        std::memcpy(out_priv, k, 32);
+        return true;
+    }
+
+    // seed BIP39 -> endereco Ethereum "0x" + 40 hex minusculo. Retorna 42 (0 se falhar).
+    static size_t seed_to_eth_address(const uint8_t seed[64], char* out_buf, secp256k1_context* ctx) {
+        uint8_t priv[32];
+        if (!eth_seed_to_privkey(seed, priv, ctx)) return 0;
+
+        secp256k1_pubkey pub;
+        if (!secp256k1_ec_pubkey_create(ctx, &pub, priv)) return 0;
+        // Pubkey DESCOMPRIMIDA: 0x04 || X(32) || Y(32); Keccak usa os 64 bytes (sem o 0x04).
+        uint8_t ser[65]; size_t l = 65;
+        secp256k1_ec_pubkey_serialize(ctx, ser, &l, &pub, SECP256K1_EC_UNCOMPRESSED);
+
+        uint8_t h[32];
+        crypto::Keccak256::hash(ser + 1, 64, h);   // ultimos 20 bytes = endereco
+
+        static const char hx[] = "0123456789abcdef";
+        out_buf[0] = '0'; out_buf[1] = 'x';
+        for (int i = 0; i < 20; ++i) {
+            out_buf[2 + i * 2]     = hx[(h[12 + i] >> 4) & 0x0f];
+            out_buf[2 + i * 2 + 1] = hx[h[12 + i] & 0x0f];
+        }
+        out_buf[42] = '\0';
+        return 42;
+    }
+
+    // Detecta se o alvo e um endereco Ethereum (comeca com 0x / 0X).
+    static bool target_is_eth(const uint8_t* t, size_t len) {
+        return len >= 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X');
+    }
+
+    // Comparacao de hex ignorando maiusc./minusc. (enderecos ETH usam checksum EIP-55).
+    static bool ci_hex_equal(const char* a, const uint8_t* b, size_t len) {
+        auto lc = [](unsigned char ch) -> unsigned char {
+            return (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch;
+        };
+        for (size_t i = 0; i < len; ++i)
+            if (lc(static_cast<unsigned char>(a[i])) != lc(b[i])) return false;
+        return true;
+    }
+
+    // seed -> compara com o alvo (BTC 1... ou ETH 0x..., detectado automaticamente).
+    static bool seed_matches_target(const uint8_t seed[64], const uint8_t* target,
+                                    size_t target_len, secp256k1_context* ctx) {
+        char buf[64];
+        if (target_is_eth(target, target_len)) {
+            size_t l = seed_to_eth_address(seed, buf, ctx);
+            return l == target_len && ci_hex_equal(buf, target, l);
+        }
+        size_t l = seed_to_p2pkh_bip44(seed, buf, ctx);
+        return l == target_len && std::memcmp(buf, target, l) == 0;
+    }
+
+    // ============================================================
     // FASTEST PATH: derive + compare sem alocar string
     // ============================================================
     static bool derive_and_compare(const char* mnemonic_str, size_t mnemonic_len,
@@ -134,11 +206,10 @@ public:
                                    salt, 8,
                                    pbkdf2_rounds, seed, 64);
 
-        // 2. seed -> endereco BIP44 (m/44'/0'/0'/0/0) P2PKH legacy
-        size_t b58_len = seed_to_p2pkh_bip44(seed, base58_buf, ctx);
-
-        if (b58_len != target_len) return false;
-        return std::memcmp(base58_buf, target_bytes, target_len) == 0;
+        // 2. seed -> compara com o alvo (BTC m/44'/0'/0'/0/0 ou ETH m/44'/60'/0'/0/0,
+        //    detectado automaticamente pelo prefixo 0x).
+        (void)base58_buf;
+        return seed_matches_target(seed, target_bytes, target_len, ctx);
     }
 
     // Derive BTC address from pre-built mnemonic string
@@ -176,39 +247,30 @@ public:
         return derive_btc_address_from_string(buf, len);
     }
 
-    static std::string derive_eth_address(const std::vector<std::string>& mnemonic_words) {
-        // NOTA: Ethereum usa a curva secp256k1 mas exige o hash Keccak-256 (não SHA256)
-        // da chave publica descompactada. Caso seu crypto_impl não possua Keccak256,
-        // este método não gerará endereços ETH válidos.
+    // Deriva o endereco Ethereum (m/44'/60'/0'/0/0 + Keccak-256) de uma string mnemonic.
+    static std::string derive_eth_address_from_string(const char* mnemonic_str, size_t mnemonic_len) {
         thread_local uint8_t seed[64];
-        thread_local uint8_t hash_buf[32];
+        thread_local char result[64];
+        thread_local secp256k1_context* ctx = nullptr;
+        if (BUILTIN_EXPECT(!ctx, 0)) {
+            ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        }
+        static const uint8_t salt[] = "mnemonic";
+        crypto::pbkdf2_hmac_sha512(mnemonic_str, mnemonic_len, salt, 8, 2048, seed, 64);
+        size_t len = seed_to_eth_address(seed, result, ctx);
+        return std::string(result, len);
+    }
+
+    static std::string derive_eth_address(const std::vector<std::string>& mnemonic_words) {
         thread_local char buf[MAX_MNEMONIC_LEN];
         size_t len = 0;
-
         for (size_t i = 0; i < mnemonic_words.size(); ++i) {
             const auto& w = mnemonic_words[i];
             std::memcpy(buf + len, w.data(), w.size());
             len += w.size();
-            if (i < mnemonic_words.size() - 1) {
-                buf[len++] = ' '; // Correção: Espaçamento
-            }
+            if (i < mnemonic_words.size() - 1) buf[len++] = ' ';
         }
-
-        static const uint8_t salt[] = "mnemonic";
-        crypto::pbkdf2_hmac_sha512(buf, len, salt, 8, 2048, seed, 64);
-
-        // Cuidado: Isto é tecnicamente invalido para Ethereum (ETH usa Keccak-256 na PubKey)
-        // Mantido apenas para não quebrar a assinatura original da sua biblioteca
-        crypto::SHA256::hash(seed, 32, hash_buf);
-
-        char hex[43];
-        hex[0] = '0'; hex[1] = 'x';
-        static const char hextable[] = "0123456789abcdef";
-        for (int i = 0; i < 20; ++i) {
-            hex[2 + i * 2]     = hextable[(hash_buf[i] >> 4) & 0x0f];
-            hex[2 + i * 2 + 1] = hextable[hash_buf[i] & 0x0f];
-        }
-        return std::string(hex, 42);
+        return derive_eth_address_from_string(buf, len);
     }
 
 public:
