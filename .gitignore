@@ -1,0 +1,3 @@
+src/runner
+*.o
+*.out

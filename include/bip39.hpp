@@ -38,18 +38,87 @@ struct SearchInterval {
 class Bip39Deriver {
 public:
     // ============================================================
+    // BIP32 / BIP44 — derivacao de chave filha
+    // ============================================================
+    // CKDpriv: deriva (k,c) -> filho no indice dado (hardened se bit 31 setado).
+    // Atualiza k e c no lugar. Retorna false se a chave resultante for invalida.
+    static bool ckd_priv(uint8_t k[32], uint8_t c[32], uint32_t index, secp256k1_context* ctx) {
+        uint8_t data[37];
+        if (index & 0x80000000u) {
+            // Hardened: 0x00 || ser256(k_par) || ser32(i)
+            data[0] = 0x00;
+            std::memcpy(data + 1, k, 32);
+        } else {
+            // Normal: serP(point(k_par)) || ser32(i)  (pubkey comprimida, 33 bytes)
+            secp256k1_pubkey pub;
+            if (!secp256k1_ec_pubkey_create(ctx, &pub, k)) return false;
+            size_t l = 33;
+            secp256k1_ec_pubkey_serialize(ctx, data, &l, &pub, SECP256K1_EC_COMPRESSED);
+        }
+        data[33] = static_cast<uint8_t>(index >> 24);
+        data[34] = static_cast<uint8_t>(index >> 16);
+        data[35] = static_cast<uint8_t>(index >> 8);
+        data[36] = static_cast<uint8_t>(index);
+
+        uint8_t I[64];
+        unsigned int md_len = 64;
+        HMAC(EVP_sha512(), c, 32, data, 37, I, &md_len);
+
+        std::memcpy(c, I + 32, 32);            // chain code filho = IR
+        // k_filho = (IL + k_par) mod n  — tweak_add valida (0 se resultado invalido)
+        if (!secp256k1_ec_seckey_tweak_add(ctx, k, I)) return false;
+        return true;
+    }
+
+    // Deriva a chave privada em m/44'/0'/0'/0/0 a partir da seed BIP39 (64 bytes).
+    static bool bip44_seed_to_privkey(const uint8_t seed[64], uint8_t out_priv[32], secp256k1_context* ctx) {
+        uint8_t I[64];
+        unsigned int md_len = 64;
+        HMAC(EVP_sha512(), "Bitcoin seed", 12, seed, 64, I, &md_len);
+        uint8_t k[32], c[32];
+        std::memcpy(k, I, 32);
+        std::memcpy(c, I + 32, 32);
+        static constexpr uint32_t H = 0x80000000u;
+        const uint32_t path[5] = { 44u | H, 0u | H, 0u | H, 0u, 0u };  // m/44'/0'/0'/0/0
+        for (int i = 0; i < 5; ++i) {
+            if (!ckd_priv(k, c, path[i], ctx)) return false;
+        }
+        std::memcpy(out_priv, k, 32);
+        return true;
+    }
+
+    // Chave privada -> endereco P2PKH legacy ("1..."). Retorna comprimento base58 (0 se falhar).
+    static size_t privkey_to_p2pkh(const uint8_t priv[32], char* out_buf, secp256k1_context* ctx) {
+        secp256k1_pubkey pub;
+        if (!secp256k1_ec_pubkey_create(ctx, &pub, priv)) return 0;
+        uint8_t ser[33]; size_t l = 33;
+        secp256k1_ec_pubkey_serialize(ctx, ser, &l, &pub, SECP256K1_EC_COMPRESSED);
+
+        uint8_t sha[32], rip[20], payload[25], cks[32];
+        crypto::SHA256::hash(ser, l, sha);
+        crypto::RIPEMD160::hash(sha, 32, rip);
+        payload[0] = 0x00;
+        std::memcpy(payload + 1, rip, 20);
+        crypto::SHA256::hash(payload, 21, cks);
+        crypto::SHA256::hash(cks, 32, cks);
+        std::memcpy(payload + 21, cks, 4);
+        return base58_encode_raw(payload, 25, out_buf);
+    }
+
+    // seed BIP39 -> endereco BIP44 m/44'/0'/0'/0/0. Retorna comprimento (0 se falhar).
+    static size_t seed_to_p2pkh_bip44(const uint8_t seed[64], char* out_buf, secp256k1_context* ctx) {
+        uint8_t priv[32];
+        if (!bip44_seed_to_privkey(seed, priv, ctx)) return 0;
+        return privkey_to_p2pkh(priv, out_buf, ctx);
+    }
+
+    // ============================================================
     // FASTEST PATH: derive + compare sem alocar string
     // ============================================================
     static bool derive_and_compare(const char* mnemonic_str, size_t mnemonic_len,
                                    const uint8_t* target_bytes, size_t target_len,
                                    int pbkdf2_rounds = 2048) {
         thread_local uint8_t seed[64];
-        thread_local uint8_t master_node[64];
-        thread_local uint8_t pub_serialized[33];
-        thread_local uint8_t hash_buf[32];
-        thread_local uint8_t ripemd_buf[20];
-        thread_local uint8_t payload[25];
-        thread_local uint8_t checksum[32];
         thread_local char base58_buf[64];
 
         // Cacheia o contexto SECP256k1 localmente por thread para máxima performance
@@ -65,35 +134,8 @@ public:
                                    salt, 8,
                                    pbkdf2_rounds, seed, 64);
 
-        // 2. HMAC-SHA512 -> Master Node (BIP32)
-        unsigned int md_len = 64;
-        HMAC(EVP_sha512(), "Bitcoin seed", 12, seed, 64, master_node, &md_len);
-
-        // 3. SECP256k1 -> Public Key
-        secp256k1_pubkey pubkey;
-        if (!secp256k1_ec_pubkey_create(ctx, &pubkey, master_node)) {
-            return false;
-        }
-        size_t pub_len = 33;
-        secp256k1_ec_pubkey_serialize(ctx, pub_serialized, &pub_len, &pubkey, SECP256K1_EC_COMPRESSED);
-
-        // 4. SHA256(pubkey) + RIPEMD160
-        crypto::SHA256::hash(pub_serialized, pub_len, hash_buf);
-        crypto::RIPEMD160::hash(hash_buf, 32, ripemd_buf);
-
-        // 5. Payload: version(0x00) + RIPEMD160(20)
-        payload[0] = 0x00;
-        std::memcpy(payload + 1, ripemd_buf, 20);
-
-        // 6. Double SHA256 for checksum
-        crypto::SHA256::hash(payload, 21, checksum);
-        crypto::SHA256::hash(checksum, 32, checksum);
-
-        // 7. Append 4-byte checksum
-        std::memcpy(payload + 21, checksum, 4);
-
-        // 8. Base58 encode ultra-rápido (Arbitrary UInt<4>)
-        size_t b58_len = base58_encode_raw(payload, 25, base58_buf);
+        // 2. seed -> endereco BIP44 (m/44'/0'/0'/0/0) P2PKH legacy
+        size_t b58_len = seed_to_p2pkh_bip44(seed, base58_buf, ctx);
 
         if (b58_len != target_len) return false;
         return std::memcmp(base58_buf, target_bytes, target_len) == 0;
@@ -102,12 +144,6 @@ public:
     // Derive BTC address from pre-built mnemonic string
     static std::string derive_btc_address_from_string(const char* mnemonic_str, size_t mnemonic_len) {
         thread_local uint8_t seed[64];
-        thread_local uint8_t master_node[64];
-        thread_local uint8_t pub_serialized[33];
-        thread_local uint8_t hash_buf[32];
-        thread_local uint8_t ripemd_buf[20];
-        thread_local uint8_t payload[25];
-        thread_local uint8_t checksum[32];
         thread_local char result[64];
 
         thread_local secp256k1_context* ctx = nullptr;
@@ -119,27 +155,8 @@ public:
 
         crypto::pbkdf2_hmac_sha512(mnemonic_str, mnemonic_len, salt, 8, 2048, seed, 64);
 
-        unsigned int md_len = 64;
-        HMAC(EVP_sha512(), "Bitcoin seed", 12, seed, 64, master_node, &md_len);
-
-        secp256k1_pubkey pubkey;
-        if (!secp256k1_ec_pubkey_create(ctx, &pubkey, master_node)) return "";
-
-        size_t pub_len = 33;
-        secp256k1_ec_pubkey_serialize(ctx, pub_serialized, &pub_len, &pubkey, SECP256K1_EC_COMPRESSED);
-
-        crypto::SHA256::hash(pub_serialized, pub_len, hash_buf);
-        crypto::RIPEMD160::hash(hash_buf, 32, ripemd_buf);
-
-        payload[0] = 0x00;
-        std::memcpy(payload + 1, ripemd_buf, 20);
-
-        crypto::SHA256::hash(payload, 21, checksum);
-        crypto::SHA256::hash(checksum, 32, checksum);
-
-        std::memcpy(payload + 21, checksum, 4);
-
-        size_t len = base58_encode_raw(payload, 25, result);
+        // seed -> endereco BIP44 (m/44'/0'/0'/0/0) P2PKH legacy
+        size_t len = seed_to_p2pkh_bip44(seed, result, ctx);
         return std::string(result, len);
     }
 

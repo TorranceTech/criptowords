@@ -5,6 +5,8 @@
 #include <iostream>
 #include <atomic>
 #include <thread>
+#include <future>
+#include <algorithm>
 #include <mutex>
 #include <cstring>
 #include <iomanip>
@@ -67,17 +69,61 @@ void BruteEngine::run(
         if (gpu_engine.init("pbkdf2_hmac512.cl")) {
             std::cout << "  - GPU: " << gpu_engine.device_name() << " (OpenCL)\n";
 
-            const int GPU_BATCH = 256;
-            std::vector<std::string> batch_mnemonics;
-            std::vector<std::vector<std::string>> batch_words;
+            const int GPU_BATCH = 8192;   // dividido entre as GPUs disponiveis
+            std::cout << "  - Verificacao BIP44: " << num_threads << " threads (pipeline com a GPU)\n";
+
+            // Um batch de trabalho: mnemonics montadas, palavras originais e seeds da GPU.
+            struct Batch {
+                std::vector<std::string> mnemonics;
+                std::vector<std::vector<std::string>> words;
+                std::vector<std::vector<uint8_t>> seeds;
+                size_t count = 0;
+            };
+            Batch bufs[2];   // double-buffering: um em verificacao, outro em montagem/GPU
+
             std::vector<size_t> idx(unknown_positions.size(), 0);
             UInt<255> processed = 0;
+            const int verify_threads = num_threads > 0 ? num_threads : 4;
 
-            secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+            // Verifica um batch em paralelo (cada thread com seu proprio contexto secp256k1).
+            auto verify_batch = [&](Batch& batch) {
+                size_t n = batch.count;
+                if (n == 0) return;
+                int nt = std::min<int>(verify_threads, static_cast<int>(n));
+                std::vector<std::thread> vts;
+                vts.reserve(nt);
+                for (int t = 0; t < nt; ++t) {
+                    vts.emplace_back([&, t, nt, n]() {
+                        secp256k1_context* lctx =
+                            secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+                        char base58_buf[64];
+                        for (size_t i = t; i < n && !found.load(std::memory_order_relaxed); i += nt) {
+                            size_t b58_len = cryptowords::Bip39Deriver::seed_to_p2pkh_bip44(
+                                batch.seeds[i].data(), base58_buf, lctx);
+                            if (b58_len == target_bytes.len &&
+                                std::memcmp(base58_buf, target_bytes.data, target_bytes.len) == 0) {
+                                found.store(true, std::memory_order_relaxed);
+                                std::lock_guard<std::mutex> lk(cout_mutex);
+                                std::cout << "\n  MATCH FOUND (GPU)!\n  Mnemonic: ";
+                                for (const auto& w : batch.words[i]) std::cout << w << " ";
+                                std::cout << std::endl;
+                            }
+                        }
+                        secp256k1_context_destroy(lctx);
+                    });
+                }
+                for (auto& t : vts) t.join();
+                total_attempts.fetch_add(n, std::memory_order_relaxed);
+            };
+
+            std::future<void> verify_future;   // verificacao do batch anterior, em voo
+            int cur = 0;
 
             while (!found.load(std::memory_order_relaxed) && processed < total_combinations) {
-                batch_mnemonics.clear();
-                batch_words.clear();
+                Batch& batch = bufs[cur];
+                batch.mnemonics.clear();
+                batch.words.clear();
+                batch.count = 0;
 
                 for (int b = 0; b < GPU_BATCH && processed + b < total_combinations; b++) {
                     std::vector<std::string> current_words(base_words.begin(), base_words.end());
@@ -88,58 +134,31 @@ void BruteEngine::run(
                     char buf[300];
                     size_t blen = 0;
                     build_mnemonic_fast(current_words, buf, blen);
-                    batch_mnemonics.emplace_back(buf, blen);
-                    batch_words.push_back(std::move(current_words));
+                    batch.mnemonics.emplace_back(buf, blen);
+                    batch.words.push_back(std::move(current_words));
+                    batch.count++;
 
                     (void)advance_odometer(idx, candidates);
                 }
+                processed += batch.count;
 
-                std::vector<std::vector<uint8_t>> seeds;
-                if (!gpu_engine.pbkdf2_batch(batch_mnemonics, pbkdf2_rounds, seeds)) {
+                // GPU: PBKDF2 do batch atual (todas as GPUs em paralelo).
+                if (!gpu_engine.pbkdf2_batch(batch.mnemonics, pbkdf2_rounds, batch.seeds)) {
                     std::cerr << "  - GPU batch falhou, retornando processamento para a CPU...\n";
+                    if (verify_future.valid()) verify_future.get();
                     use_gpu = false;
                     break;
                 }
 
-                for (size_t i = 0; i < seeds.size() && !found.load(std::memory_order_relaxed); i++) {
-                    uint8_t master_node[64];
-                    unsigned int md_len = 64;
-                    HMAC(EVP_sha512(), "Bitcoin seed", 12, seeds[i].data(), 64, master_node, &md_len);
+                // Espera a verificacao do batch anterior (rodou em paralelo com a GPU acima).
+                if (verify_future.valid()) verify_future.get();
 
-                    secp256k1_pubkey pubkey;
-                    if (!secp256k1_ec_pubkey_create(ctx, &pubkey, master_node)) continue;
-
-                    uint8_t pub_serialized[33];
-                    size_t pub_len = 33;
-                    secp256k1_ec_pubkey_serialize(ctx, pub_serialized, &pub_len, &pubkey, SECP256K1_EC_COMPRESSED);
-
-                    uint8_t hash_buf[32], ripemd_buf[20], payload[25], checksum[32];
-                    char base58_buf[64];
-
-                    crypto::SHA256::hash(pub_serialized, pub_len, hash_buf);
-                    crypto::RIPEMD160::hash(hash_buf, 32, ripemd_buf);
-
-                    payload[0] = 0x00;
-                    std::memcpy(payload + 1, ripemd_buf, 20);
-                    crypto::SHA256::hash(payload, 21, checksum);
-                    crypto::SHA256::hash(checksum, 32, checksum);
-                    std::memcpy(payload + 21, checksum, 4);
-
-                    size_t b58_len = cryptowords::Bip39Deriver::base58_encode_raw(payload, 25, base58_buf);
-
-                    if (b58_len == target_bytes.len && std::memcmp(base58_buf, target_bytes.data, target_bytes.len) == 0) {
-                        found.store(true, std::memory_order_relaxed);
-                        std::lock_guard<std::mutex> lk(cout_mutex);
-                        std::cout << "\n  MATCH FOUND (GPU)!\n  Mnemonic: ";
-                        for (const auto& w : batch_words[i]) std::cout << w << " ";
-                        std::cout << std::endl;
-                    }
-                    ++processed;
-                    total_attempts.fetch_add(1, std::memory_order_relaxed);
-                }
+                // Dispara a verificacao deste batch e segue montando o proximo (overlap).
+                verify_future = std::async(std::launch::async, [&, cur]() { verify_batch(bufs[cur]); });
+                cur ^= 1;
             }
 
-            secp256k1_context_destroy(ctx);
+            if (verify_future.valid()) verify_future.get();
 
             if (use_gpu) {
                 auto end = std::chrono::high_resolution_clock::now();

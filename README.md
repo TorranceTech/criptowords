@@ -1,9 +1,135 @@
 # criptowords
 
-Esse programa está em testes, para compilar basta entrar na pasta ``/src/`` depois compilar com: 
+Recuperador de seed **BIP39** por força bruta: você informa o mnemônico com `?` nas
+posições que não sabe e o endereço-alvo, e o programa descobre as palavras que faltam.
+Usa CPU (multithread) e, com `--gpu`, **todas** as GPUs OpenCL detectadas em paralelo.
 
-``g++ -O3 -mavx2 main.cpp cli.cpp brute_engine.cpp cli_parser.cpp -o runner -lsecp256k1 -lcrypto -lOpenCL -lpthread -std=c++26 -march=native``
+> Derivação usada: **BIP44 legacy `m/44'/0'/0'/0/0`** → endereços que começam com `1...`.
+> (Endereços `3...` SegWit-P2SH ou `bc1...` bech32 **não** são suportados no momento.)
 
-apos isso, o executavel será gerado com o nome ``runner``  em ``/src/`` 
+---
 
-por estar em teste, pode ser que ocorra erros na compilação ou na execução do programa, se ocorrer, me informe via as issues para que as correções sejam realizadas.
+## 1. Requisitos
+
+- `libsecp256k1-dev`, `libssl-dev` (OpenSSL) e um runtime OpenCL (ex.: driver NVIDIA).
+
+```bash
+sudo apt install -y libsecp256k1-dev libssl-dev
+```
+
+## 2. Compilar
+
+Entre na pasta `src/` e compile (gera o executável `runner` em `src/`):
+
+```bash
+cd src
+```
+```bash
+g++ -O3 -march=native -mavx2 -std=c++23 -DCL_TARGET_OPENCL_VERSION=300 main.cpp cli.cpp brute_engine.cpp cli_parser.cpp -o runner -lsecp256k1 -lcrypto -lOpenCL -lpthread
+```
+
+> **Importante:** sempre rode o `runner` de dentro de `src/` — ele procura o kernel
+> `pbkdf2_hmac512.cl` e as wordlists em `../wordlist/` por caminho relativo.
+
+---
+
+## 3. Testar
+
+> **Regra de ouro da colagem:** o mnemônico inteiro fica **entre aspas, numa linha só,
+> sem apertar Enter no meio**. Se quebrar a linha dentro das aspas, a quebra vira parte
+> do mnemônico e o resultado dá errado. Confira a contagem com `echo "$M" | wc -w`
+> (tem que dar **12** ou **24**).
+
+### Teste 1 — sanidade (deriva 1 endereço)
+Deve imprimir `BTC: 1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA`:
+
+```bash
+./runner --mnemonic "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" --lang english
+```
+
+### Teste 2 — força bruta na GPU (descobre a última palavra)
+Aqui a última palavra é `?`. O programa deve achar `about` e imprimir `MATCH FOUND (GPU)!`.
+As três linhas abaixo são curtas de propósito (não quebram na colagem); cole **uma de cada vez**:
+
+```bash
+M="$(printf 'abandon %.0s' {1..11})?"
+```
+```bash
+H=1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA
+```
+```bash
+./runner --mnemonic "$M" --hash "$H" --lang english --gpu
+```
+
+- A 1ª linha monta os 11 `abandon` + `?` automaticamente (sem contar na mão).
+- A 2ª guarda o endereço-alvo.
+- A 3ª roda a busca.
+
+### Teste 3 — velocidade (as duas GPUs sob carga)
+Duas palavras desconhecidas (`? ?`) + alvo inexistente → varre tudo (~4,2M) e mostra a taxa:
+
+```bash
+M="$(printf 'abandon %.0s' {1..10})? ?"
+```
+```bash
+./runner --mnemonic "$M" --hash 1AlvoInexistenteXXXXXXXXXXXXXXXXXX --lang english --gpu
+```
+
+Enquanto roda, em **outro terminal**, veja as duas placas trabalhando:
+
+```bash
+watch -n1 nvidia-smi
+```
+
+---
+
+## 4. Uso real (seus puzzles)
+
+Escreva o que você sabe e ponha `?` onde não sabe. Ex. (uma linha só, sem quebra):
+
+```bash
+M="palavra1 palavra2 ? palavra4 palavra5 ? palavra7 palavra8 palavra9 palavra10 palavra11 palavra12"
+```
+```bash
+H=<endereço_do_puzzle_começando_com_1>
+```
+```bash
+./runner --mnemonic "$M" --hash "$H" --lang english --gpu
+```
+
+Confira antes de rodar:
+
+```bash
+echo "$M" | wc -w    # tem que dar 12 ou 24
+```
+
+---
+
+## 5. Opções
+
+| Opção | Descrição |
+|---|---|
+| `--mnemonic "..."` | Palavras; use `?` nas posições desconhecidas |
+| `--hash <endereço>` | Endereço BTC alvo (`1...`) a encontrar |
+| `--lang <idioma>` | Wordlist (padrão: `english`) |
+| `--wordlist <arquivo>` | Wordlist customizada |
+| `--fix "pos:palavra"` | Fixa uma palavra numa posição (posições começam em 0) |
+| `--allow "pos:pal1\|pal2"` | Restringe as palavras possíveis de uma posição |
+| `--threads <n>` | Nº de threads de verificação na CPU (padrão: todas) |
+| `--rounds <n>` | Iterações PBKDF2 (padrão: 2048, BIP39) |
+| `--gpu` | Usa todas as GPUs OpenCL. Sem isso, roda só na CPU |
+| `--help` | Ajuda |
+
+Variáveis de ambiente (opcionais): `GPU_DEBUG=1` mostra a divisão de trabalho por placa;
+`GPU_BALANCE=1` liga o balanceamento experimental por velocidade de GPU (por padrão a
+divisão é igual entre as placas, que se mostrou mais rápida e estável).
+
+---
+
+## Observações
+
+- O programa **não valida o checksum** do BIP39 (a última palavra), então ele testa também
+  combinações inválidas — funciona, mas não é o mais eficiente.
+- A saída **ETH** do modo de derivação direta é conhecida como incorreta (usa SHA256 em vez de
+  Keccak-256); confie apenas na saída **BTC**.
+- Por estar em teste, podem ocorrer erros — reporte via issues.
