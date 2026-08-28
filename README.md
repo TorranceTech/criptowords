@@ -9,6 +9,34 @@ Usa CPU (multithread) e, com `--gpu`, **todas** as GPUs OpenCL detectadas em par
 
 ---
 
+## Novidades desta versão
+
+O que foi adicionado/corrigido em relação à versão anterior:
+
+- **Derivação BIP44 correta (`m/44'/0'/0'/0/0`).** Agora deriva a chave pela árvore
+  BIP32 (CKD) e gera o endereço legacy `1...` **igual ao que as carteiras reais mostram**.
+  Antes o endereço saía da chave-mestra `m` direto, sem caminho de derivação — não
+  correspondia a nenhuma carteira. Validado contra uma referência independente:
+  `abandon`×11 + `about` → `1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA`.
+- **Suporte a múltiplas GPUs.** Com `--gpu`, o programa detecta e usa **todas** as GPUs
+  OpenCL ao mesmo tempo (testado com RTX 3060 + GTX 1070).
+- **Correções no motor OpenCL** (`gpu_engine.hpp`): o `clBuildProgram` recebia uma lista
+  de device nula (erro `CL_INVALID_VALUE`), e o tratamento de erro estourava com
+  `std::bad_alloc` — o kernel nunca compilava. Corrigido; agora roda de fato na GPU.
+- **Pipeline paralelo** (`brute_engine.cpp`): enquanto as GPUs calculam o próximo lote,
+  a CPU verifica o anterior (double-buffering), com a verificação BIP44 distribuída em
+  várias threads. Resultado: ~61 mil tentativas/s usando as duas placas.
+- **Build corrigido:** `-std=c++23` (o `c++26` do comando antigo não existe no g++ 13) e
+  `-DCL_TARGET_OPENCL_VERSION=300`. Requer `libsecp256k1-dev`.
+- **Facilidades:** scripts `src/teste.sh` (mostra um `MATCH FOUND` de exemplo) e
+  `src/buscar.sh` (você edita o mnemônico e o alvo e roda), além deste README e um
+  `.gitignore` para o binário.
+
+> **Ainda em aberto:** só endereços `1...`; não valida o checksum do BIP39 (testa também
+> combinações inválidas); a saída ETH continua incorreta (usa SHA256 no lugar de Keccak-256).
+
+---
+
 ## 1. Requisitos
 
 - `libsecp256k1-dev`, `libssl-dev` (OpenSSL) e um runtime OpenCL (ex.: driver NVIDIA).
